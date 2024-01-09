@@ -62,7 +62,7 @@ impl Field {
     /// Returns a statement which encodes the oneof field.
     pub fn encode(&self, ident: TokenStream) -> TokenStream {
         quote! {
-            if let Some(ref oneof) = #ident {
+            if let Some(::scalar::OpenVariant::Known(ref oneof)) = #ident {
                 oneof.encode(buf)
             }
         }
@@ -72,7 +72,56 @@ impl Field {
     pub fn merge(&self, ident: TokenStream) -> TokenStream {
         let ty = &self.ty;
         quote! {
-            #ty::merge(#ident, tag, wire_type, buf, ctx)
+            {
+                let (result, is_some) = match std::mem::take(#ident) {
+                    None => {
+                        // So far, for that oneof we've seen:
+                        // - 0 unknown
+                        // - 0 known
+                        // We are currently seeing the first known
+                        let mut option = None;
+                        let result = #ty::merge(&mut option, tag, wire_type, buf, ctx);
+                        let is_some = option.is_some();
+                        if let Some(variant) = option {
+                            *#ident = Some(::scalar::OpenVariant::Known(variant))
+                        };
+                        (result, is_some)
+                    }
+                    Some(::scalar::OpenVariant::Known(variant)) => {
+                        // So far, for that oneof we've seen:
+                        // - 0+ unknown
+                        // - 1+ known
+                        // We are currently seeing a new known. (last one wins)
+                        let mut option = Some(variant);
+                        let result = #ty::merge(&mut option, tag, wire_type, buf, ctx);
+                        let is_some = option.is_some();
+                        if let Some(variant) = option {
+                            *#ident = Some(::scalar::OpenVariant::Known(variant))
+                        };
+                        (result, is_some)
+                    }
+                    Some(::scalar::OpenVariant::Unknown) => {
+                        // So far, for that oneof we've seen:
+                        // - 1+ unknown
+                        // - 0 known
+                        // We are currently seeing the first known
+                        let mut option = None;
+                        let result = #ty::merge(&mut option, tag, wire_type, buf, ctx);
+                        let is_some = option.is_some();
+                        if let Some(variant) = option {
+                            *#ident = Some(::scalar::OpenVariant::Known(variant))
+                        } else {
+                            *#ident = Some(::scalar::OpenVariant::Unknown)
+                        };
+                        (result, is_some)
+                    }
+                };
+                match (result, is_some) {
+                    (Err(err), _) => Err(err),
+                    (Ok(()), true) => Ok(()),
+                    (Ok(()), false) => Err(::prost::DecodeError::new("merge was expected to set option")),
+                }
+            }
         }
     }
 
@@ -80,7 +129,15 @@ impl Field {
     pub fn encoded_len(&self, ident: TokenStream) -> TokenStream {
         let ty = &self.ty;
         quote! {
-            #ident.as_ref().map_or(0, #ty::encoded_len)
+            match #ident.as_ref() {
+                None => 0,
+                Some(scalar::OpenVariant::Unknown) => {
+                    // We don't encode unknown variants. We could if the undecoded bytes were a
+                    // payload of `Unknown`.
+                    0
+                },
+                Some(scalar::OpenVariant::Known(value)) => #ty::encoded_len(value),
+            }
         }
     }
 

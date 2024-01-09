@@ -255,10 +255,309 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
     Ok(expanded)
 }
 
-#[proc_macro_derive(Message, attributes(prost))]
-pub fn message(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    try_message(input.into()).unwrap().into()
+/// Takes a token stream such as `Clone, PartialEq, :: prost :: Message` and
+/// returns `Clone, PartialEq`.
+fn strip_prost_messages_from_procmacro_attrs(token_stream: TokenStream) -> (TokenStream, usize) {
+    let mut tokens = vec![];
+    let mut token_names = vec![];
+    for token in token_stream {
+        token_names.push(token.to_string());
+        tokens.push(token);
+    }
+
+    let pairs = token_names
+        .iter()
+        .map(|string| string.as_str())
+        .zip(tokens.into_iter())
+        .collect::<Vec<_>>();
+    let mut slice = pairs.as_slice();
+
+    let mut tokens = vec![];
+    let mut prost_messages_removed = 0;
+    loop {
+        match slice {
+            [(",", _), (":", _), (":", _), ("prost", _), (":", _), (":", _), ("Message", _), tail @ ..] =>
+            {
+                prost_messages_removed = prost_messages_removed + 1;
+                slice = tail;
+            }
+            [(":", _), (":", _), ("prost", _), (":", _), (":", _), ("Message", _), tail @ ..] => {
+                prost_messages_removed = prost_messages_removed + 1;
+                slice = tail;
+            }
+            [(_, token), tail @ ..] => {
+                tokens.push(token.to_owned());
+                slice = tail;
+            }
+            [] => break,
+        }
+    }
+    (
+        TokenStream::from_iter(tokens.into_iter()),
+        prost_messages_removed,
+    )
 }
+
+/// Applies `strip_prost_messages_from_procmacro_attrs` to all attributes of a struct
+fn strip_prost_messages_from_all_procmacro_attrs(
+    attrs: Vec<syn::Attribute>,
+) -> Result<Vec<syn::Attribute>, Error> {
+    let mut prost_messages_removed = 0;
+    let attrs = attrs
+        .into_iter()
+        .map(|mut attr| {
+            if !&attr.meta.path().is_ident("derive") {
+                return attr;
+            }
+
+            let syn::Meta::List(ref mut meta_list) = &mut attr.meta else {
+                return attr;
+            };
+
+            let (tokens, incr) =
+                strip_prost_messages_from_procmacro_attrs(std::mem::take(&mut meta_list.tokens));
+            meta_list.tokens = tokens;
+            prost_messages_removed = prost_messages_removed + incr;
+
+            attr
+        })
+        .collect();
+
+    if prost_messages_removed != 1 {
+        bail!("`open_oneof` procmacro should only be attached above a prost::Message");
+    }
+
+    Ok(attrs)
+}
+
+/// Takes a struct such as
+///
+/// ```
+/// pub struct SubscribeRequest
+/// {
+///     #[prost(message, optional, tag = "1")]
+///     pub target_user_uid: ::core::option::Option< ::scalar::proto::platform::scalar::UserUid, >,
+///     #[prost(oneof = "subscribe_request::Inner", tags = "2")]
+///     pub inner: ::core::option::Option<subscribe_request::Inner>,
+/// }
+/// ```
+///
+/// and returns a new one without the field attrs, like this:
+///
+/// ```
+/// pub struct SubscribeRequest
+/// {
+///     pub target_user_uid: ::core::option::Option< ::scalar::proto::platform::scalar::UserUid, >,
+///     pub inner: ::core::option::Option<subscribe_request::Inner>,
+/// }
+/// ```
+fn strip_field_attrs(data: syn::Data) -> Result<syn::Data, Error> {
+    let mut variant_data = match data {
+        Data::Struct(variant_data) => variant_data,
+        Data::Enum(..) => bail!("open_oneof can not be derived for an enum"),
+        Data::Union(..) => bail!("open_oneof can not be derived for a union"),
+    };
+
+    variant_data.fields = match variant_data.fields {
+        Fields::Named(fields) => Fields::Named(FieldsNamed {
+            named: fields
+                .named
+                .into_iter()
+                .map(|mut field| {
+                    field.attrs.clear();
+                    field
+                })
+                .collect(),
+            ..fields
+        }),
+        Fields::Unnamed(fields) => Fields::Unnamed(FieldsUnnamed {
+            unnamed: fields
+                .unnamed
+                .into_iter()
+                .map(|mut field| {
+                    field.attrs.clear();
+                    field
+                })
+                .collect(),
+            ..fields
+        }),
+        fields @ Fields::Unit => fields,
+    };
+    Ok(Data::Struct(variant_data))
+}
+
+/// Convert a field such as this
+/// ```
+/// #[prost(oneof = "subscribe_request::Inner", tags = "2")]
+/// pub inner: ::core::option::Option<subscribe_request::Inner>,
+/// ```
+/// to this:
+/// ```
+/// #[prost(oneof = "subscribe_request::Inner", tags = "2")]
+/// pub inner: ::core::option::Option<::scalar::OpenVariant<subscribe_request::Inner>>,
+/// ```
+fn add_openvariant_to_oneof_field(mut field: syn::Field) -> Result<syn::Field, Error> {
+    let is_oneof_field = field.attrs.iter().any(|attr| {
+        if !attr.meta.path().is_ident("prost") {
+            return false;
+        }
+        let syn::Meta::List(ref meta_list) = attr.meta else {
+            return false;
+        };
+
+        meta_list
+            .tokens
+            .clone()
+            .into_iter()
+            .any(|token| token.to_string() == "oneof")
+    });
+
+    if !is_oneof_field {
+        return Ok(field);
+    }
+
+    field.ty = match field.ty {
+        syn::Type::Path(mut outer_path) => {
+            let Some(syn::punctuated::Pair::End(mut option_segment)) =
+                outer_path.path.segments.pop()
+            else {
+                bail!("oneof field's type is unexpected")
+            };
+
+            // I have no idea how to generate a proper span ¯\_(ツ)_/¯
+            let injected_span = option_segment.ident.span();
+
+            // These arguments are from `Option<arguments>`. We will move them to
+            // `Option<OpenVariant<arguments>>`
+            let inner_arguments = option_segment.arguments;
+
+            let syn::PathArguments::AngleBracketed(inner_angle_bracketed) = inner_arguments.clone()
+            else {
+                bail!("oneof field is not AngleBracketed")
+            };
+
+            option_segment.arguments =
+                syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
+                    args: syn::punctuated::Punctuated::from_iter(std::iter::once(
+                        syn::GenericArgument::Type(syn::Type::Path(syn::TypePath {
+                            path: syn::Path {
+                                segments: syn::punctuated::Punctuated::from_iter(
+                                    vec![
+                                        syn::PathSegment {
+                                            ident: syn::Ident::new("scalar", injected_span),
+                                            arguments: syn::PathArguments::None,
+                                        },
+                                        syn::PathSegment {
+                                            ident: syn::Ident::new("OpenVariant", injected_span),
+                                            arguments: inner_arguments,
+                                        },
+                                    ]
+                                    .into_iter(),
+                                ),
+                                ..outer_path.path
+                            },
+                            ..outer_path.clone()
+                        })),
+                    )),
+                    ..inner_angle_bracketed
+                });
+
+            outer_path.path.segments.push(option_segment);
+            syn::Type::Path(outer_path)
+        }
+        _ => {
+            bail!("oneof field is not of type Path")
+        }
+    };
+    Ok(field)
+}
+
+/// Applies `convert_oneof_field_option_to_openvariant` to all fields of a struct
+fn convert_oneof_options_to_openenum(data: syn::Data) -> Result<syn::Data, Error> {
+    let mut variant_data = match data {
+        Data::Struct(variant_data) => variant_data,
+        Data::Enum(..) => bail!("open_oneof can not be derived for an enum"),
+        Data::Union(..) => bail!("open_oneof can not be derived for a union"),
+    };
+
+    variant_data.fields = match variant_data.fields {
+        Fields::Named(fields) => Fields::Named(FieldsNamed {
+            named: fields
+                .named
+                .into_iter()
+                .map(|field| add_openvariant_to_oneof_field(field))
+                .try_collect()?,
+            ..fields
+        }),
+        Fields::Unnamed(fields) => Fields::Unnamed(FieldsUnnamed {
+            unnamed: fields
+                .unnamed
+                .into_iter()
+                .map(|field| add_openvariant_to_oneof_field(field))
+                .try_collect()?,
+            ..fields
+        }),
+        fields @ Fields::Unit => fields,
+    };
+    Ok(Data::Struct(variant_data))
+}
+
+/// The impact of this proc macro is to inject a `scalar::OpenVariant`
+/// type inside `Option` types used for oneofs. This new type is defined
+/// externally and has the same structure as a regular option:
+/// ```
+/// pub enum OpenVariant<T> {
+///     Known(T),
+///     Unknown,
+/// }
+/// ```
+///
+/// `open_openof` can be enabled from a `build.rs` file. For example:
+/// ```
+/// tonic_build::configure()
+///   // [...]
+///   .message_attribute(".", "#[open_prost_oneof::open_oneof()]")
+///   // [...]
+/// ```
+///
+/// `open_oneof` suppresses the `prost::Message` proc macro for the proto
+/// messages (i.e. not the enumerations and oneofs) and generates the same
+/// functions as `prost::Message` with a few diffs for oneof fields in
+/// order to use `OpenVariant`.
+#[proc_macro_attribute]
+pub fn open_oneof(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let methods = try_message(TokenStream::from(item.clone())).expect("failed to compute methods");
+
+    let mut derive_input = syn::parse_macro_input!(item as DeriveInput);
+
+    // 3 struct transformations that inject `OpenVariant` and remove prost::Message.
+
+    // [strip_prost_messages_from_all_procmacro_attrs] can be executed  at any point. It is
+    // independent from the 2 other tranformations.
+    derive_input.attrs = strip_prost_messages_from_all_procmacro_attrs(derive_input.attrs)
+        .expect("failed to strip_prost_messages_from_all_procmacro_attrs");
+
+    // [convert_oneof_options_to_openenum] should be executed before [strip_field_attrs]
+    derive_input.data = convert_oneof_options_to_openenum(derive_input.data)
+        .expect("failed to convert_oneof_options_to_openenum");
+
+    derive_input.data = strip_field_attrs(derive_input.data).expect("failed to strip_field_attrs");
+
+    proc_macro::TokenStream::from(quote! {
+        #methods
+        #derive_input
+    })
+}
+
+// All the code below is unused but keept in order to minimize rebase conflicts
+
+// #[proc_macro_derive(Message, attributes(prost))]
+// pub fn message(input: TokenStream) -> TokenStream {
+//     try_message(input).unwrap()
+// }
 
 fn try_enumeration(input: TokenStream) -> Result<TokenStream, Error> {
     let input: DeriveInput = syn::parse2(input)?;

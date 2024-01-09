@@ -1,5 +1,5 @@
 [package]
-name = "prost-derive"
+name = "open-prost-oneof"
 readme = "README.md"
 description = "Generate encoding and decoding implementations for Prost annotated types."
 version.workspace = true

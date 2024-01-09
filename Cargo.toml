@@ -1,27 +1,7 @@
 [workspace]
-members = [
-  "conformance",
-  "prost",
-  "prost-build",
-  "prost-derive",
-  "prost-types",
-  "protobuf",
-  "tests",
-  "tests-2015",
-  "tests-no-std",
-  "tests/single-include",
-]
-
-exclude = [
-  # The fuzz crate can't be compiled or tested without the 'cargo fuzz' command,
-  # so exclude it from normal builds.
-  "fuzz",
-  # Same counts for the afl fuzz targets
-  "afl",
-]
+members = ["prost-derive"]
 
 resolver = "2"
-
 [workspace.package]
 version = "0.13.1"
 authors = [
@@ -34,6 +14,3 @@ license = "Apache-2.0"
 repository = "https://github.com/tokio-rs/prost"
 rust-version = "1.70"
 edition = "2021"
-
-[profile.bench]
-debug = true
